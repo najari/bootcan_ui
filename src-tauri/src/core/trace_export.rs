@@ -26,7 +26,7 @@ const CANFRAME_V1_SCHEMA: &str = r#"{"type":"object","properties":{"ts_ns":{"typ
 pub struct TraceBus {
     pub channel_id: String,
     pub name: String,
-    pub bus: u8,
+    pub bus: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,8 @@ pub enum ExportFormat {
     Trc,
     Mcap,
     Csv,
+    Asc,
+    Blf,
 }
 
 impl ExportFormat {
@@ -42,6 +44,8 @@ impl ExportFormat {
             "trc" => Some(Self::Trc),
             "mcap" => Some(Self::Mcap),
             "csv" => Some(Self::Csv),
+            "asc" => Some(Self::Asc),
+            "blf" => Some(Self::Blf),
             _ => None,
         }
     }
@@ -55,6 +59,18 @@ pub fn export_trace(
     frames: &mut [CapturedFrame],
     buses: &[TraceBus],
     databases: &HashMap<String, DbcDatabase>,
+) -> Result<u64, String> {
+    export_trace_with_metadata(path, format, start_epoch_ns, frames, buses, databases, None)
+}
+
+pub fn export_trace_with_metadata(
+    path: &Path,
+    format: ExportFormat,
+    start_epoch_ns: u64,
+    frames: &mut [CapturedFrame],
+    buses: &[TraceBus],
+    databases: &HashMap<String, DbcDatabase>,
+    metadata: Option<&canlog::core::Metadata>,
 ) -> Result<u64, String> {
     if frames.is_empty() {
         return Err("No trace frames to export".to_string());
@@ -73,6 +89,25 @@ pub fn export_trace(
             write_mcap(tmp, start_epoch_ns, frames, databases)
         }),
         ExportFormat::Csv => write_atomic(path, |tmp| write_csv(tmp, frames)),
+        ExportFormat::Asc | ExportFormat::Blf => {
+            let mut metadata = metadata
+                .cloned()
+                .unwrap_or_else(|| super::log_adapter::metadata_from_epoch(start_epoch_ns));
+            if metadata.blf_start.is_none() {
+                metadata.blf_start = metadata
+                    .date_text
+                    .as_deref()
+                    .and_then(canlog::core::parse_date);
+            }
+            let format = if format == ExportFormat::Asc {
+                canlog::formats::Format::Asc
+            } else {
+                canlog::formats::Format::Blf
+            };
+            write_atomic(path, |tmp| {
+                super::log_adapter::write(tmp, format, frames, buses, &metadata)
+            })
+        }
     }
 }
 
@@ -104,7 +139,10 @@ pub fn frames_from_player(frames: &[crate::core::message::CanFrame]) -> (u64, Ve
                 (frame.dlc as usize).min(frame.data.len()).min(64)
             };
             CapturedFrame {
-                offset_ns: (delta * 1e9).round() as u64,
+                offset_ns: frame
+                    .timestamp_ns
+                    .map(|n| n.max(0) as u64)
+                    .unwrap_or_else(|| (delta * 1e9).round() as u64),
                 id: frame.id,
                 is_extended: frame.is_extended,
                 is_remote: frame.is_remote,
@@ -112,15 +150,21 @@ pub fn frames_from_player(frames: &[crate::core::message::CanFrame]) -> (u64, Ve
                 data: frame.data[..n].to_vec(),
                 channel: frame.channel.clone(),
                 is_tx: frame.direction.eq_ignore_ascii_case("tx"),
+                direction: frame.direction.clone(),
+                is_fd: frame.is_fd,
+                brs: frame.brs,
+                esi: frame.esi,
+                raw_dlc: frame.raw_dlc,
+                bus: frame.bus,
             }
         })
         .collect();
     (start_epoch_ns, captured)
 }
 
-fn bus_assignments(frames: &[CapturedFrame], buses: &[TraceBus]) -> HashMap<String, (u8, String)> {
+fn bus_assignments(frames: &[CapturedFrame], buses: &[TraceBus]) -> HashMap<String, (u16, String)> {
     let mut map = HashMap::new();
-    let mut used: HashSet<u8> = HashSet::new();
+    let mut used: HashSet<u16> = HashSet::new();
     let mut next: u16 = 1;
     for frame in frames {
         if map.contains_key(&frame.channel) {
@@ -131,10 +175,10 @@ fn bus_assignments(frames: &[CapturedFrame], buses: &[TraceBus]) -> HashMap<Stri
             map.insert(frame.channel.clone(), (bus.bus, bus.name.clone()));
             continue;
         }
-        while next <= 255 && used.contains(&(next as u8)) {
+        while used.contains(&next) && next < u16::MAX {
             next += 1;
         }
-        let bus = if next <= 255 { next as u8 } else { 1 };
+        let bus = frame.bus.unwrap_or(next);
         used.insert(bus);
         let name = if frame.channel.is_empty() {
             format!("bus{bus}")
@@ -149,11 +193,11 @@ fn bus_assignments(frames: &[CapturedFrame], buses: &[TraceBus]) -> HashMap<Stri
 /// One v2.1 message line, without the line ending.
 ///
 /// Column widths follow `log_browser.trc_writer._MSG_FMT`.
-pub fn format_trc_line(frame: &CapturedFrame, msg_nr: u64, bus: u8) -> String {
+pub fn format_trc_line(frame: &CapturedFrame, msg_nr: u64, bus: u16) -> String {
     let offset_ms = frame.offset_ns as f64 / 1e6;
     let kind = if frame.is_remote {
         "RR"
-    } else if frame.dlc > 8 || frame.data.len() > 8 {
+    } else if frame.is_fd || frame.dlc > 8 || frame.data.len() > 8 {
         "FD"
     } else {
         "DT"
@@ -205,7 +249,7 @@ fn write_trc(
 fn write_trc_header(
     out: &mut BufWriter<File>,
     start_epoch_ns: u64,
-    buses: &HashMap<String, (u8, String)>,
+    buses: &HashMap<String, (u16, String)>,
 ) -> Result<(), String> {
     let start_secs = start_epoch_ns as f64 / 1e9;
     let ole_days = start_secs / 86400.0 + OLE_UNIX_DAYS;
@@ -227,7 +271,7 @@ fn write_trc_header(
             .to_string(),
         ";   Bus  Name".to_string(),
     ];
-    let mut listed: Vec<(u8, String)> = buses.values().cloned().collect();
+    let mut listed: Vec<(u16, String)> = buses.values().cloned().collect();
     listed.sort_by_key(|(bus, _)| *bus);
     listed.dedup_by_key(|(bus, _)| *bus);
     if listed.is_empty() {
@@ -331,7 +375,7 @@ fn decoded_payload(
     ts_ns: u64,
     db: &DbcDatabase,
 ) -> Vec<u8> {
-    let decoded = db.decode_message(frame.id, &frame.data);
+    let decoded = db.decode_message(message.id, &frame.data);
     let mut payload = serde_json::Map::new();
     payload.insert(
         "_message".to_string(),
@@ -364,7 +408,7 @@ fn decoded_payload(
 }
 
 fn raw_can_payload(frame: &CapturedFrame, ts_ns: u64) -> Vec<u8> {
-    let is_fd = frame.dlc > 8 || frame.data.len() > 8;
+    let is_fd = frame.is_fd || frame.dlc > 8 || frame.data.len() > 8;
     serde_json::json!({
         "ts_ns": ts_ns,
         "arbitration_id": frame.id,
@@ -372,8 +416,8 @@ fn raw_can_payload(frame: &CapturedFrame, ts_ns: u64) -> Vec<u8> {
         "is_remote_frame": frame.is_remote,
         "is_error_frame": false,
         "is_fd": is_fd,
-        "bitrate_switch": false,
-        "error_state_indicator": false,
+        "bitrate_switch": frame.brs,
+        "error_state_indicator": frame.esi,
         "dlc": frame.dlc,
         "data": frame.data,
     })
@@ -405,7 +449,9 @@ fn write_mcap(
         let ts_ns = start_epoch_ns.saturating_add(frame.offset_ns);
         let known = databases
             .get(&frame.channel)
-            .and_then(|db| db.get_message(frame.id))
+            .and_then(|db| {
+                db.get_message(frame.id | if frame.is_extended { 0x8000_0000 } else { 0 })
+            })
             .cloned();
 
         if let Some(message) = known {
@@ -546,6 +592,12 @@ mod tests {
             data: if remote { Vec::new() } else { data.to_vec() },
             channel: "net-a".to_string(),
             is_tx: tx,
+            direction: if tx { "tx" } else { "rx" }.into(),
+            is_fd: false,
+            brs: false,
+            esi: false,
+            raw_dlc: None,
+            bus: None,
         }
     }
 
@@ -604,7 +656,7 @@ mod tests {
         assert!(text.contains("\r\n"));
 
         let mut map = StdHashMap::new();
-        map.insert(3u8, "net-a".to_string());
+        map.insert(3u16, "net-a".to_string());
         let mut player = TracePlayer::new();
         let count = player
             .load_file(path.clone(), Some(map), None)

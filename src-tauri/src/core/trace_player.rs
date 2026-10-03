@@ -20,6 +20,9 @@ pub struct TracePlayer {
     state: PlaybackState,
     start_time: Option<tokio::time::Instant>,
     playback_start_timestamp: f64,
+    source_metadata: Option<canlog::core::Metadata>,
+    pub load_issues: usize,
+    pub load_issue_examples: Vec<String>,
 }
 
 impl TracePlayer {
@@ -31,6 +34,9 @@ impl TracePlayer {
             state: PlaybackState::Stopped,
             start_time: None,
             playback_start_timestamp: 0.0,
+            source_metadata: None,
+            load_issues: 0,
+            load_issue_examples: vec![],
         }
     }
 
@@ -39,9 +45,34 @@ impl TracePlayer {
     pub async fn load_file(
         &mut self,
         path: PathBuf,
-        bus_to_channel: Option<std::collections::HashMap<u8, String>>,
+        bus_to_channel: Option<std::collections::HashMap<u16, String>>,
         progress_callback: Option<Box<dyn Fn(usize) + Send + Sync>>,
     ) -> Result<usize, String> {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("asc") || e.eq_ignore_ascii_case("blf"))
+        {
+            let loaded = tokio::task::spawn_blocking(move || {
+                super::log_adapter::load(
+                    &path,
+                    &bus_to_channel.unwrap_or_default(),
+                    progress_callback.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("Trace loading task failed: {e}"))??;
+            let mut frames = loaded.frames;
+            frames.sort_by(|a, b| a.timestamp_ns.cmp(&b.timestamp_ns));
+            self.frames = frames.into();
+            self.current_index = 0;
+            self.state = PlaybackState::Stopped;
+            self.playback_start_timestamp = 0.0;
+            self.source_metadata = Some(loaded.metadata);
+            self.load_issues = loaded.issues;
+            self.load_issue_examples = loaded.issue_examples;
+            return Ok(self.frames.len());
+        }
         // Detect format from extension
         let format = path
             .extension()
@@ -51,7 +82,7 @@ impl TracePlayer {
                 "trc" => Some(TraceFormat::Trc),
                 _ => None,
             })
-            .ok_or_else(|| "Unknown file format. Expected .csv or .trc".to_string())?;
+            .ok_or_else(|| "Unknown file format. Expected .asc, .blf, .csv or .trc".to_string())?;
 
         // Read entire file into memory for parallel processing
         // For large files (1.7M lines), this is acceptable (~100-200MB)
@@ -137,6 +168,9 @@ impl TracePlayer {
 
         // Convert to VecDeque
         self.frames = frames.into_iter().collect();
+        self.source_metadata = None;
+        self.load_issues = 0;
+        self.load_issue_examples.clear();
 
         self.current_index = 0;
         self.state = PlaybackState::Stopped;
@@ -236,12 +270,7 @@ impl TracePlayer {
             let next_timestamp = self.frames[self.current_index + 1].timestamp;
             let delta = (next_timestamp - current_timestamp) / self.playback_speed;
             let delay_duration = tokio::time::Duration::from_secs_f64(delta.max(0.0));
-            // Cap delay at 1 second to prevent very long waits
-            if delay_duration.as_secs_f64() > 1.0 {
-                tokio::time::Duration::from_secs(1)
-            } else {
-                delay_duration
-            }
+            delay_duration
         } else {
             // Last frame
             tokio::time::Duration::from_secs(0)
@@ -270,6 +299,10 @@ impl TracePlayer {
     /// Get all loaded frames (for immediate decoding)
     pub fn get_all_frames(&self) -> Vec<CanFrame> {
         self.frames.iter().cloned().collect()
+    }
+
+    pub fn source_metadata(&self) -> Option<canlog::core::Metadata> {
+        self.source_metadata.clone()
     }
 
     /// Parse CSV line
@@ -314,6 +347,7 @@ impl TracePlayer {
             timestamp,
             channel,
             direction,
+            ..CanFrame::default()
         })
     }
 
@@ -325,7 +359,7 @@ impl TracePlayer {
     fn parse_trc_line(
         line: &str,
         start_time_days: Option<f64>,
-        bus_to_channel: &Option<std::collections::HashMap<u8, String>>,
+        bus_to_channel: &Option<std::collections::HashMap<u16, String>>,
     ) -> Result<CanFrame, String> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 8 {
@@ -339,7 +373,7 @@ impl TracePlayer {
         // Detect format: if parts[2] looks like a number, it's the bus (no Type field)
         // If parts[2] looks like "DT" or similar, parts[3] is the bus (with Type field)
         let (time_offset_idx, bus_idx, id_idx, direction_idx, dlc_idx, data_start_idx) =
-            if parts.len() >= 3 && parts[2].trim().parse::<u8>().is_ok() {
+            if parts.len() >= 3 && parts[2].trim().parse::<u16>().is_ok() {
                 // Format without Type: "1) 0.274 1 Rx 011C - 8 00 00..."
                 // parts[0] = "1)", parts[1] = "0.274", parts[2] = "1" (bus), parts[3] = "Rx", parts[4] = "011C" (ID)
                 (1, 2, 4, 3, 6, 7)
@@ -373,7 +407,7 @@ impl TracePlayer {
         };
 
         // Parse bus number (column B)
-        let bus_num = parts[bus_idx].trim().parse::<u8>().map_err(|e| {
+        let bus_num = parts[bus_idx].trim().parse::<u16>().map_err(|e| {
             format!(
                 "Failed to parse bus number '{}' at index {}: {}",
                 parts[bus_idx], bus_idx, e
@@ -409,7 +443,7 @@ impl TracePlayer {
         let is_extended = id_str.len() > 4 || id > 0x7FF;
 
         // Type column (DT/FD/RR/...) is present on v2.x lines. RR is a remote frame.
-        let is_remote = if parts[2].trim().parse::<u8>().is_err() {
+        let is_remote = if parts[2].trim().parse::<u16>().is_err() {
             parts[2].trim().eq_ignore_ascii_case("RR")
         } else {
             false
@@ -459,6 +493,10 @@ impl TracePlayer {
             timestamp,
             channel,
             direction: direction.to_string(),
+            timestamp_ns: Some((time_offset_ms * 1e6).round() as i64),
+            bus: Some(bus_num),
+            is_fd: parts[2].eq_ignore_ascii_case("FD") || dlc > 8,
+            ..CanFrame::default()
         })
     }
 }

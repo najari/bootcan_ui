@@ -1,3 +1,4 @@
+import { frameMessageId } from "../types/can";
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
@@ -90,7 +91,7 @@ export function TraceList() {
               const idHex = frame.isExtended
                 ? `0x${frame.id.toString(16).toUpperCase().padStart(8, "0")}`
                 : `0x${frame.id.toString(16).toUpperCase().padStart(3, "0")}`;
-              const name = messageNames.get(frame.channel)?.get(frame.id) ?? "";
+              const name = messageNames.get(frame.channel)?.get(frameMessageId(frame)) ?? "";
               return (
                 <div
                   key={item.key}
@@ -100,18 +101,18 @@ export function TraceList() {
                   style={{ top: item.start, height: ROW_HEIGHT }}
                 >
                   <span className="w-24 shrink-0 text-can-text-secondary">
-                    {frame.timestamp.toFixed(4)}
+                    {frame.timestamp.toFixed(9)}
                   </span>
                   <span className="w-20 shrink-0 truncate font-sans text-can-text-secondary">
                     {netName(frame.channel)}
                   </span>
                   <span className="w-10 shrink-0 uppercase text-xxs">{frame.direction}</span>
                   <span className={`w-24 shrink-0 ${frame.isExtended ? "text-can-accent-purple" : ""}`}>
-                    {idHex}
+                    <span title={`Raw DLC: ${frame.rawDlc ?? frame.dlc}; FD: ${!!frame.isFd}; BRS: ${!!frame.brs}; ESI: ${!!frame.esi}`}>{idHex}{frame.isFd ? " FD" : frame.isRemote ? " RTR" : ""}</span>
                   </span>
                   <span className="w-44 shrink-0 truncate font-sans font-medium">{name}</span>
                   <span className="w-10 shrink-0">{frame.dlc}</span>
-                  <span className="flex-1 truncate">
+                  <span className="flex-1 truncate" title={frame.data.map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ")}>
                     {frame.data
                       .slice(0, frame.dlc)
                       .map((b) => b.toString(16).toUpperCase().padStart(2, "0"))

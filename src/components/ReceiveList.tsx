@@ -1,3 +1,4 @@
+import { frameMessageId, monitorKey as frameMonitorKey } from "../types/can";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
@@ -19,7 +20,7 @@ const COLUMNS: Array<{ key: SortKey | "data"; label: string; sortable: boolean }
 const DEFAULT_WIDTHS = [22, 10, 10, 5, 5, 30, 9, 9];
 
 function monitorKey(e: MonitorEntry): string {
-  return `${e.frame.channel}-${e.frame.id}-${e.frame.direction}`;
+  return frameMonitorKey(e.frame);
 }
 
 function formatCycle(ms: number): string {
@@ -48,7 +49,7 @@ function useExpandedSignals(entries: MonitorEntry[]): Map<string, DecodedSignal[
 
     const requests = pending.map(({ entry }) => ({
       channelId: entry.frame.channel,
-      messageId: entry.frame.id,
+      messageId: frameMessageId(entry.frame),
       data: entry.frame.data,
     }));
     invoke<DecodedSignal[][]>("decode_messages_batch", { requests })
@@ -110,7 +111,7 @@ export function ReceiveList() {
 
   const netName = (id: string) => nets.find((n) => n.id === id)?.name ?? id;
   const nameFor = (entry: MonitorEntry) =>
-    messageNames.get(entry.frame.channel)?.get(entry.frame.id) ?? null;
+    messageNames.get(entry.frame.channel)?.get(frameMessageId(entry.frame)) ?? null;
 
   const entries = useMemo(() => {
     let list = Array.from(monitorMessages.values());
@@ -337,7 +338,7 @@ const ReceiveRow = memo(function ReceiveRow({
   return (
     <>
       <tr
-        data-key={`${frame.channel}-${frame.id}-${frame.direction}`}
+        data-key={frameMonitorKey(frame)}
         onClick={onClick}
         onDoubleClick={onToggleExpand}
         className={`cursor-default ${
@@ -367,6 +368,7 @@ const ReceiveRow = memo(function ReceiveRow({
         </td>
         <td className={`font-mono ${frame.isExtended ? "text-can-accent-purple" : ""}`}>
           {idHex}
+          {frame.isFd && <span className="ml-1 text-xxs text-can-accent-cyan" title={`BRS: ${!!frame.brs}; ESI: ${!!frame.esi}`}>FD</span>}
           {frame.isRemote && (
             <span className="ml-1 text-xxs px-1 rounded bg-can-accent-amber/20 text-can-accent-amber">
               RTR
@@ -447,7 +449,7 @@ function SignalSubRows({
               </>
             )}
           </span>
-          <span className="font-mono text-can-text-muted truncate">raw: {sig.rawValue}</span>
+          <span className="font-mono text-can-text-muted truncate">raw: {sig.rawText ?? sig.rawValue}</span>
         </div>
       ))}
     </div>

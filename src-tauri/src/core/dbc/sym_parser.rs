@@ -166,7 +166,8 @@ impl SymParser {
                         let tokens = split_ws_quotes(rest);
                         if let Some((name, start_bit)) = parse_assignment(&tokens) {
                             if let Some(mut signal) = signal_defs.get(&name).cloned() {
-                                signal.start_bit = placed_start_bit(start_bit, signal.byte_order);
+                                signal.start_bit =
+                                    placed_start_bit(start_bit, signal.byte_order).into();
                                 push_signal(msg, signal);
                             }
                         }
@@ -398,8 +399,8 @@ fn parse_signal_tokens(tokens: &[String], positioned: bool) -> Option<Signal> {
 
     Some(Signal {
         name,
-        start_bit,
-        length,
+        start_bit: start_bit.into(),
+        length: length.into(),
         byte_order: attrs.byte_order,
         value_type: info.value_type,
         factor: attrs.factor,
@@ -471,8 +472,8 @@ fn apply_mux(msg: &mut OpenMessage, mux: MuxSpec) {
             0,
             Signal {
                 name: format!("{} MUX", msg.name),
-                start_bit: placed_start_bit(mux.start, mux.byte_order),
-                length: mux.length,
+                start_bit: placed_start_bit(mux.start, mux.byte_order).into(),
+                length: mux.length.into(),
                 byte_order: mux.byte_order,
                 value_type: ValueType::Unsigned,
                 factor: 1.0,

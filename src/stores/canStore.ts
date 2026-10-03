@@ -1,3 +1,4 @@
+import { frameMessageId, monitorKey } from "../types/can";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { invoke } from "@tauri-apps/api/core";
@@ -39,6 +40,8 @@ interface CanState {
 
   // Filter rules (mirrors backend FilterSet per active net)
   filters: Array<{ type: string; [key: string]: any }>;
+  filterLogic: "and" | "or";
+  filterError: string | null;
 
   // Message buffers
   traceMessages: CanFrame[];
@@ -106,7 +109,7 @@ interface CanState {
   // Recording
   toggleRecording: () => Promise<void>;
   stopRecording: () => Promise<void>;
-  exportTrace: (filePath: string, format: "trc" | "mcap" | "csv") => Promise<number>;
+  exportTrace: (filePath: string, format: "trc" | "mcap" | "csv" | "asc" | "blf", filtered?: boolean) => Promise<number>;
 
   // Trace playback
   loadTrace: (filePath: string) => Promise<number>;
@@ -144,6 +147,8 @@ interface CanState {
 
   // Filters
   setFilters: (filters: Array<{ type: string; [key: string]: any }>) => void;
+  setFilterLogic: (logic: "and" | "or") => void;
+  refreshFilteredTrace: () => Promise<void>;
 
   // Project
   saveProject: (filePath: string) => Promise<void>;
@@ -161,6 +166,8 @@ interface CanState {
 // Event listener cleanup
 let unlistenBatch: UnlistenFn | null = null;
 let unlistenTrace: UnlistenFn | null = null;
+let unlistenPlayback: UnlistenFn | null = null;
+let unlistenLoadReport: UnlistenFn | null = null;
 let unlistenStats: UnlistenFn | null = null;
 let unlistenInterfaces: UnlistenFn | null = null;
 let unlistenChannelError: UnlistenFn | null = null;
@@ -185,6 +192,7 @@ export interface TraceWindow {
 }
 
 interface TraceUiBatch {
+  visible?: boolean[];
   epoch: number;
   startIndex: number;
   frames: CanFrame[];
@@ -219,6 +227,8 @@ export const useCanStore = create<CanState>((set, get) => ({
   nets: [],
   activeNetId: null,
   filters: [],
+  filterLogic: "and",
+  filterError: null,
   traceMessages: [],
   monitorMessages: new Map<string, MonitorEntry>(),
   maxMessages: TRACE_WINDOW,
@@ -277,6 +287,14 @@ export const useCanStore = create<CanState>((set, get) => ({
         }
       );
 
+      unlistenPlayback = await listen<"stopped" | "playing" | "paused">("playback-state", (event) => set({playbackState:event.payload}));
+      unlistenLoadReport = await listen<{frames: number; issues: number; examples: string[]}>("trace-load-report", (event) => {
+        const { frames, issues, examples } = event.payload;
+        set({ traceNotice: issues > 0
+          ? `Loaded ${frames.toLocaleString()} CAN frames; skipped ${issues} ancillary records. ${examples[0] ?? ""}`
+          : `Loaded ${frames.toLocaleString()} CAN frames` });
+      });
+
       // Batched frame delivery (~30 Hz): one store update per batch
       unlistenBatch = await listen<CanFrame[]>("can-message-batch", (event) => {
         const state = get();
@@ -294,7 +312,7 @@ export const useCanStore = create<CanState>((set, get) => ({
           if (!isTracePlayback) {
             newMonitor = new Map(s.monitorMessages);
             for (const frame of frames) {
-              const key = `${frame.channel}-${frame.id}-${frame.direction}`;
+              const key = monitorKey(frame);
               const existing = newMonitor.get(key);
               if (existing) {
                 const dtMs = (frame.timestamp - existing.lastTimestamp) * 1000;
@@ -338,11 +356,11 @@ export const useCanStore = create<CanState>((set, get) => ({
           const wanted = new Set(
             st.selectedPlotSignals.map((sig) => `${sig.channelId}-${sig.messageId}`)
           );
-          const matchingFrames = frames.filter((f) => wanted.has(`${f.channel}-${f.id}`));
+          const matchingFrames = frames.filter((f) => wanted.has(`${f.channel}-${frameMessageId(f)}`));
           if (matchingFrames.length > 0) {
             const requests = matchingFrames.map((f) => ({
               channelId: f.channel,
-              messageId: f.id,
+              messageId: frameMessageId(f),
               data: f.data,
             }));
             invoke<DecodedSignal[][]>("decode_messages_batch", { requests })
@@ -354,7 +372,7 @@ export const useCanStore = create<CanState>((set, get) => ({
                   results.forEach((decoded, i) => {
                     const frame = matchingFrames[i];
                     for (const sig of s.selectedPlotSignals) {
-                      if (sig.channelId !== frame.channel || sig.messageId !== frame.id) continue;
+                      if (sig.channelId !== frame.channel || sig.messageId !== frameMessageId(frame)) continue;
                       const d = decoded.find((x) => x.name === sig.signalName);
                       if (!d) continue;
                       const key = `${sig.channelId}-${sig.messageId}-${sig.signalName}`;
@@ -381,7 +399,7 @@ export const useCanStore = create<CanState>((set, get) => ({
       // Background trace tail. Independent of the receive-list filter and of
       // which window is open.
       unlistenTrace = await listen<TraceUiBatch>("trace-frame-batch", (event) => {
-        const { epoch, startIndex, frames } = event.payload;
+        const { epoch, startIndex, frames, visible } = event.payload;
         if (frames.length === 0) return;
         const state = get();
         if (state.isPaused || state.traceSource !== "live" || epoch !== state.traceEpoch) return;
@@ -390,14 +408,14 @@ export const useCanStore = create<CanState>((set, get) => ({
           const end = startIndex + frames.length;
           if (startIndex > s.traceHighWater) {
             return {
-              traceMessages: frames.slice(-s.maxMessages),
+              traceMessages: frames.filter((_, i) => visible?.[i] !== false).slice(-s.maxMessages),
               traceHighWater: end,
             };
           }
           const skip = Math.max(0, s.traceHighWater - startIndex);
           if (skip >= frames.length) return s;
           return {
-            traceMessages: [...s.traceMessages, ...frames.slice(skip)].slice(-s.maxMessages),
+            traceMessages: [...s.traceMessages, ...frames.filter((_, i) => i >= skip && visible?.[i] !== false)].slice(-s.maxMessages),
             traceHighWater: end,
           };
         });
@@ -538,15 +556,15 @@ export const useCanStore = create<CanState>((set, get) => ({
     });
   },
 
-  exportTrace: async (filePath, format) => {
+  exportTrace: async (filePath, format, filtered = false) => {
     const source =
-      get().isRecording || get().traceFrameCount > 0 ? "buffer" : "playback";
+      get().traceSource === "file" && !get().isRecording ? "playback" : "buffer";
     try {
       const count = await invoke<number>("export_trace", {
         filePath,
         format,
         buses: traceBuses(get().nets),
-        source,
+        source, filtered,
       });
       set({ traceNotice: `Exported ${count.toLocaleString()} frames` });
       return count;
@@ -576,10 +594,10 @@ export const useCanStore = create<CanState>((set, get) => ({
     });
 
     const allFrames = await invoke<CanFrame[]>("get_trace_frames");
-    const firstTimestamp = allFrames.length > 0 ? allFrames[0].timestamp : 0;
+    const firstTimestamp = allFrames[0]?.timestamp > 1e9 ? allFrames[0].timestamp : 0;
     const traceFrames = allFrames.map((frame) => ({
       ...frame,
-      timestamp: frame.timestamp - firstTimestamp,
+      timestamp: frame.timestampNs != null ? frame.timestampNs / 1e9 : frame.timestamp - firstTimestamp,
     }));
 
     set({
@@ -587,7 +605,9 @@ export const useCanStore = create<CanState>((set, get) => ({
       playbackFrameCount: count,
       traceMessages: traceFrames,
       traceSource: "file",
+      playbackState: "stopped",
     });
+    await rebuildFilePlots();
     return count;
   },
 
@@ -863,6 +883,19 @@ export const useCanStore = create<CanState>((set, get) => ({
   setSelectedTransmitRow: (id) => set({ selectedTransmitRowId: id }),
 
   setFilters: (filters) => set({ filters }),
+  setFilterLogic: (filterLogic) => set({ filterLogic }),
+  refreshFilteredTrace: async () => {
+    const state = get();
+    if (state.traceSource === "file" && state.loadedTraceFile) {
+      const frames = await invoke<CanFrame[]>("get_trace_frames");
+      const origin = frames[0]?.timestamp > 1e9 ? frames[0].timestamp : 0;
+      set({ traceMessages: frames.map((f) => ({ ...f, timestamp: f.timestampNs != null ? f.timestampNs / 1e9 : f.timestamp - origin })) });
+      await rebuildFilePlots();
+    } else {
+      const window = await invoke<TraceWindow>("get_trace_window", { limit: TRACE_WINDOW });
+      set({ traceMessages: window.frames, traceHighWater: window.frameCount });
+    }
+  },
 
   // --- Project ---
 
@@ -891,7 +924,7 @@ export const useCanStore = create<CanState>((set, get) => ({
       signalValues: r.signalValues ?? null,
     }));
 
-    await invoke("save_project", { filePath, nets, filters, transmitRows });
+    await invoke("save_project", { filePath, nets, filters, filterLogic: state.filterLogic, transmitRows });
   },
 
   loadProject: async (filePath: string) => {
@@ -927,6 +960,7 @@ export const useCanStore = create<CanState>((set, get) => ({
     set({
       nets,
       filters: project.filters.map((f) => f.data),
+      filterLogic: project.filterLogic === "or" ? "or" : "and",
       transmitRows,
       activeNetId: nets.length > 0 ? nets[0].id : null,
       messageNames: new Map(),
@@ -971,6 +1005,7 @@ export const useCanStore = create<CanState>((set, get) => ({
         plotData: newPlotData,
       };
     });
+    void rebuildFilePlots();
   },
 
   removePlotSignal: (signal: PlotSignal) => {
@@ -1029,6 +1064,10 @@ export const cleanupCanStore = () => {
   unlistenBatch = null;
   unlistenTrace?.();
   unlistenTrace = null;
+  unlistenPlayback?.();
+  unlistenPlayback = null;
+  unlistenLoadReport?.();
+  unlistenLoadReport = null;
   unlistenStats?.();
   unlistenStats = null;
   unlistenInterfaces?.();
@@ -1040,3 +1079,39 @@ export const cleanupCanStore = () => {
     txCountTimer = null;
   }
 };
+
+/** Rebuild file plots from the currently visible frames; source frames remain in Rust. */
+async function rebuildFilePlots() {
+  const state = useCanStore.getState();
+  if (state.traceSource !== "file") return;
+  const frames = state.traceMessages;
+  const selected = state.selectedPlotSignals;
+  const keys = new Set(selected.map((s) => `${s.channelId}-${s.messageId}`));
+  const matching = frames.filter((f) => !f.isRemote && keys.has(`${f.channel}-${frameMessageId(f)}`));
+  const data = new Map<string, PlotDataPoint[]>(selected.map((s) => [`${s.channelId}-${s.messageId}-${s.signalName}`, []]));
+  try {
+    for (let start = 0; start < matching.length; start += 2000) {
+      const batch = matching.slice(start, start + 2000);
+      const rows = await invoke<DecodedSignal[][]>("decode_messages_batch", {requests: batch.map((f) => ({channelId:f.channel,messageId:frameMessageId(f),data:f.data}))});
+      const current = useCanStore.getState();
+      if (current.traceMessages !== frames || current.selectedPlotSignals !== selected) return;
+      rows.forEach((signals, i) => {
+        const f = batch[i];
+        for (const wanted of selected) {
+          if (wanted.channelId !== f.channel || wanted.messageId !== frameMessageId(f)) continue;
+          const value = signals.find((s) => s.name === wanted.signalName);
+          if (value) data.get(`${wanted.channelId}-${wanted.messageId}-${wanted.signalName}`)!.push({time:f.timestamp,value:value.physicalValue});
+        }
+      });
+    }
+    const current = useCanStore.getState();
+    for (const [key, points] of data) {
+      const cap = Math.min(state.plotMaxDataPoints,100000);
+      if (points.length > cap) {
+        const step = Math.ceil(points.length / cap);
+        data.set(key, points.filter((_, i) => i % step === 0 || i === points.length - 1).slice(-cap));
+      }
+    }
+    if (current.traceMessages === frames && current.selectedPlotSignals === selected) useCanStore.setState({plotData:data});
+  } catch (error) { useCanStore.setState({traceNotice:String(error)}); }
+}

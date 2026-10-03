@@ -11,12 +11,14 @@ import {
   FolderOpenIcon,
 } from "./icons";
 
-type ExportFormat = "mcap" | "trc" | "csv";
+type ExportFormat = "mcap" | "trc" | "csv" | "asc" | "blf";
 
 const EXPORT_FORMATS: { id: ExportFormat; label: string }[] = [
   { id: "mcap", label: "MCAP" },
   { id: "trc", label: "TRC" },
   { id: "csv", label: "CSV" },
+  { id: "asc", label: "ASC" },
+  { id: "blf", label: "BLF" },
 ];
 
 export function Toolbar() {
@@ -24,6 +26,7 @@ export function Toolbar() {
     useCanStore();
   const anyConnected = useAnyConnected();
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mcap");
+  const [filteredExport, setFilteredExport] = useState(false);
 
   const handleExport = async () => {
     if (traceFrameCount === 0 && (isRecording || playbackFrameCount === 0)) return;
@@ -38,7 +41,7 @@ export function Toolbar() {
       const path = filePath.toLowerCase().endsWith(`.${chosen.id}`)
         ? filePath
         : `${filePath}.${chosen.id}`;
-      await exportTrace(path, chosen.id);
+      await exportTrace(path, chosen.id, filteredExport);
     } catch (error) {
       console.error("Failed to export trace:", error);
     }
@@ -160,6 +163,9 @@ export function Toolbar() {
             </option>
           ))}
         </select>
+        <label className="flex items-center gap-1 text-xs shrink-0" title="Export frames matching the active filters">
+          <input type="checkbox" checked={filteredExport} onChange={(e) => setFilteredExport(e.target.checked)} />Filtered
+        </label>
         <button
           onClick={() => handleExport().catch(console.error)}
           className="btn btn-secondary flex items-center gap-1.5 shrink-0"

@@ -28,6 +28,7 @@ pub struct PeriodicJob {
 
 /// Application state shared across all Tauri commands
 pub struct AppState {
+    pub display_filter: Arc<RwLock<core::filter::FilterSet>>,
     pub channel_manager: Arc<RwLock<ChannelManager>>,
     /// Active periodic transmit jobs by job id
     pub periodic_jobs: Arc<RwLock<HashMap<String, PeriodicJob>>>,
@@ -36,6 +37,7 @@ pub struct AppState {
     /// Background trace retained independently of the on-screen window
     pub trace_recorder: TraceRecorder,
     /// Trace player for replaying log files (using tokio::RwLock for async compatibility)
+    pub playback_generation: Arc<std::sync::atomic::AtomicU64>,
     pub trace_player: Arc<TokioRwLock<TracePlayer>>,
     /// DBC databases loaded per channel (channel_id -> DBC database)
     pub dbc_databases: Arc<RwLock<HashMap<String, DbcDatabase>>>,
@@ -46,10 +48,12 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            display_filter: Arc::new(RwLock::new(core::filter::FilterSet::default())),
             channel_manager: Arc::new(RwLock::new(ChannelManager::new())),
             periodic_jobs: Arc::new(RwLock::new(HashMap::new())),
             trace_logger: Arc::new(RwLock::new(None)),
             trace_recorder: TraceRecorder::new(),
+            playback_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             trace_player: Arc::new(TokioRwLock::new(TracePlayer::new())),
             dbc_databases: Arc::new(RwLock::new(HashMap::new())),
             frame_batcher: FrameBatcher::new(),
@@ -59,7 +63,11 @@ impl Default for AppState {
 
 /// Emits buffered frames as `can-message-batch` at ~30 Hz (or immediately
 /// when the batcher signals an early flush).
-fn spawn_batch_flusher(app: tauri::AppHandle, batcher: FrameBatcher) {
+fn spawn_batch_flusher(
+    app: tauri::AppHandle,
+    batcher: FrameBatcher,
+    filter: Arc<RwLock<core::filter::FilterSet>>,
+) {
     use tauri::Emitter;
 
     tauri::async_runtime::spawn(async move {
@@ -69,7 +77,8 @@ fn spawn_batch_flusher(app: tauri::AppHandle, batcher: FrameBatcher) {
                 _ = tokio::time::sleep(interval) => {}
                 _ = batcher.early_flush_signaled() => {}
             }
-            let frames = batcher.drain();
+            let mut frames = batcher.drain();
+            frames.retain(|f| filter.read().matches(f));
             if !frames.is_empty() {
                 if let Err(e) = app.emit("can-message-batch", &frames) {
                     log::error!("Failed to emit can-message-batch: {:?}", e);
@@ -80,14 +89,23 @@ fn spawn_batch_flusher(app: tauri::AppHandle, batcher: FrameBatcher) {
 }
 
 /// Forwards newly captured trace frames to the UI at ~30 Hz.
-fn spawn_trace_flusher(app: tauri::AppHandle, recorder: TraceRecorder) {
+fn spawn_trace_flusher(
+    app: tauri::AppHandle,
+    recorder: TraceRecorder,
+    filter: Arc<RwLock<core::filter::FilterSet>>,
+) {
     use tauri::Emitter;
 
     tauri::async_runtime::spawn(async move {
         let interval = std::time::Duration::from_millis(core::batcher::FLUSH_INTERVAL_MS);
         loop {
             tokio::time::sleep(interval).await;
-            let batch = recorder.take_ui_batch(4_000);
+            let mut batch = recorder.take_ui_batch(4_000);
+            batch.visible = batch
+                .frames
+                .iter()
+                .map(|f| filter.read().matches(f))
+                .collect();
             if !batch.frames.is_empty() {
                 if let Err(e) = app.emit("trace-frame-batch", &batch) {
                     log::error!("Failed to emit trace-frame-batch: {:?}", e);
@@ -135,9 +153,11 @@ pub fn run() {
             use tauri::Manager;
             spawn_hotplug_watcher(app.handle().clone());
             let batcher = app.state::<AppState>().frame_batcher.clone();
-            spawn_batch_flusher(app.handle().clone(), batcher);
+            let filter = app.state::<AppState>().display_filter.clone();
+            spawn_batch_flusher(app.handle().clone(), batcher, filter);
             let recorder = app.state::<AppState>().trace_recorder.clone();
-            spawn_trace_flusher(app.handle().clone(), recorder);
+            let filter = app.state::<AppState>().display_filter.clone();
+            spawn_trace_flusher(app.handle().clone(), recorder, filter);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -177,6 +197,7 @@ pub fn run() {
             encode_signals,
             get_all_signals,
             set_advanced_filter,
+            set_display_filter,
             save_project,
             load_project,
         ])

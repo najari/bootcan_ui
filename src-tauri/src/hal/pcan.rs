@@ -457,6 +457,7 @@ fn reader_loop(
                 timestamp,
                 channel: String::new(),
                 direction: "rx".to_string(),
+                ..CanFrame::default()
             };
 
             if tx.try_send(frame).is_err() {

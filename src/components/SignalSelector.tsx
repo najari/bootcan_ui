@@ -87,7 +87,7 @@ export function SignalSelector() {
         if (signal.valueType === "unsigned" || signal.valueType === "signed" || 
             signal.valueType === "float" || signal.valueType === "double") {
           // const channelName = nets.find(c => c.id === msg.channelId)?.name || msg.channelId;
-          const idHex = `0x${msg.messageId.toString(16).toUpperCase().padStart(3, "0")}`;
+          const idHex = `0x${(msg.messageId & 0x1fffffff).toString(16).toUpperCase().padStart(3, "0")}`;
           const displayText = `${signal.name} (${msg.messageName} @ ${idHex})${signal.unit ? ` [${signal.unit}]` : ""}`;
           
           options.push({
@@ -274,7 +274,7 @@ export function SignalSelector() {
                             </span>
                           </div>
                           <div className="text-xs text-can-text-secondary mt-0.5 truncate">
-                            {option.messageName} @ 0x{option.messageId.toString(16).toUpperCase().padStart(3, "0")}
+                            {option.messageName} @ 0x{(option.messageId & 0x1fffffff).toString(16).toUpperCase().padStart(3, "0")}
                             {option.unit && ` • ${option.unit}`}
                           </div>
                         </div>

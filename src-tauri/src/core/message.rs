@@ -20,6 +20,19 @@ pub struct CanFrame {
     pub channel: String,
     /// Direction: "rx" for received, "tx" for transmitted
     pub direction: String,
+    #[serde(default)]
+    pub is_fd: bool,
+    #[serde(default)]
+    pub brs: bool,
+    #[serde(default)]
+    pub esi: bool,
+    #[serde(default)]
+    pub raw_dlc: Option<u8>,
+    /// Exact file/trace offset; avoids floating-point loss during re-export.
+    #[serde(default)]
+    pub timestamp_ns: Option<i64>,
+    #[serde(default)]
+    pub bus: Option<u16>,
 }
 
 impl Default for CanFrame {
@@ -33,6 +46,12 @@ impl Default for CanFrame {
             timestamp: 0.0,
             channel: String::new(),
             direction: "rx".to_string(),
+            is_fd: false,
+            brs: false,
+            esi: false,
+            raw_dlc: None,
+            timestamp_ns: None,
+            bus: None,
         }
     }
 }
@@ -50,6 +69,7 @@ impl CanFrame {
             timestamp: 0.0,
             channel: String::new(),
             direction: "tx".to_string(),
+            ..Self::default()
         }
     }
 
@@ -65,6 +85,7 @@ impl CanFrame {
             timestamp: 0.0,
             channel: String::new(),
             direction: "tx".to_string(),
+            ..Self::default()
         }
     }
 
@@ -79,6 +100,7 @@ impl CanFrame {
             timestamp: 0.0,
             channel: String::new(),
             direction: "tx".to_string(),
+            ..Self::default()
         }
     }
 
@@ -144,6 +166,9 @@ impl CanFdFrame {
                 timestamp: 0.0,
                 channel: String::new(),
                 direction: "tx".to_string(),
+                is_fd: true,
+                brs,
+                ..CanFrame::default()
             },
             brs,
             esi: false,
@@ -162,6 +187,21 @@ pub struct FramePayload {
     pub data: Vec<u8>,
     #[serde(default)]
     pub channel: Option<String>,
+}
+
+impl FramePayload {
+    pub fn validate_classic(&self) -> Result<(), String> {
+        if self.dlc > 8 || self.data.len() > 8 {
+            return Err("Connected adapters currently support Classic CAN transmission (up to 8 bytes); CAN FD is supported for log analysis".into());
+        }
+        if self.id > if self.is_extended { 0x1fff_ffff } else { 0x7ff } {
+            return Err("CAN ID out of range".into());
+        }
+        if !self.is_remote && self.data.len() != self.dlc as usize {
+            return Err("CAN payload length differs from DLC".into());
+        }
+        Ok(())
+    }
 }
 
 impl From<&CanFrame> for FramePayload {
@@ -192,6 +232,7 @@ impl From<FramePayload> for CanFrame {
             timestamp: 0.0,
             channel: payload.channel.unwrap_or_default(),
             direction: "tx".to_string(),
+            ..Self::default()
         }
     }
 }

@@ -37,5 +37,6 @@ export interface ProjectFile {
   version: string;
   nets: ProjectNet[];
   filters: ProjectFilter[];
+  filterLogic?: "and" | "or";
   transmitRows: ProjectTransmitRow[];
 }

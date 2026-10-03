@@ -5,9 +5,10 @@ import { MonitorWindow } from "./components/MonitorWindow";
 import { PlotPanel } from "./components/PlotPanel";
 import { Toolbar } from "./components/Toolbar";
 import { NetManager } from "./components/NetManager";
-import { FilterPanel } from "./components/FilterPanel";
+import { FilterPanel, useDisplayFilterSync } from "./components/FilterPanel";
 
 function App() {
+  useDisplayFilterSync();
   const initializeBackend = useCanStore((s) => s.initializeBackend);
   const viewTab = useCanStore((s) => s.viewTab);
 

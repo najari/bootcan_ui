@@ -8,7 +8,13 @@ export interface CanFrame {
   data: number[];
   timestamp: number;
   channel: string; // net id the frame belongs to
-  direction: "rx" | "tx";
+  direction: "rx" | "tx" | "unknown";
+  isFd?: boolean;
+  brs?: boolean;
+  esi?: boolean;
+  rawDlc?: number | null;
+  timestampNs?: number | null;
+  bus?: number | null;
 }
 
 /** Aggregated per-ID entry for the receive (monitor) list. */
@@ -91,6 +97,7 @@ export interface TransmitRow {
 export interface DecodedSignal {
   name: string;
   rawValue: number;
+  rawText?: string | null;
   physicalValue: number;
   unit: string;
   valueName: string | null;
@@ -132,6 +139,17 @@ export interface PlotDataPoint {
 
 export type SortKey = "name" | "id" | "channel" | "direction" | "dlc" | "cycleTime" | "count" | "timestamp";
 export type SortDir = "asc" | "desc";
+
+/** DBC's Extended marker is a database key, never a wire arbitration ID. */
+export function dbcId(id: number, extended: boolean): number {
+  return (id & 0x1fffffff) + (extended ? 0x80000000 : 0);
+}
+
+export function frameMessageId(frame: CanFrame): number { return dbcId(frame.id, frame.isExtended); }
+
+export function monitorKey(frame: CanFrame): string {
+  return `${frame.channel}-${frameMessageId(frame)}-${frame.isRemote}-${!!frame.isFd}-${frame.direction}`;
+}
 
 export interface MonitorSort {
   key: SortKey;

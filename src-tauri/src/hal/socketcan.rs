@@ -168,6 +168,7 @@ impl CanInterface for SocketCanInterface {
                         timestamp,
                         channel: self.id.clone(),
                         direction: "rx".to_string(),
+                        ..CanFrame::default()
                     });
                 }
                 Err(e) => {

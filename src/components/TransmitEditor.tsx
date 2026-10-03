@@ -75,8 +75,8 @@ export function TransmitEditor({ row, onClose }: TransmitEditorProps) {
         const contiguous = ids[ids.length - 1] - ids[0] + 1 === ids.length;
         const idLabel =
           ids.length > 1 && contiguous
-            ? `0x${ids[0].toString(16).toUpperCase()}-0x${ids[ids.length - 1].toString(16).toUpperCase()}`
-            : `0x${ids[0].toString(16).toUpperCase()}`;
+            ? `0x${(ids[0] & 0x1fffffff).toString(16).toUpperCase()}-0x${(ids[ids.length - 1] & 0x1fffffff).toString(16).toUpperCase()}`
+            : `0x${(ids[0] & 0x1fffffff).toString(16).toUpperCase()}`;
         return { id: ids[0], name, label: `${name} (${idLabel})` };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -122,9 +122,13 @@ export function TransmitEditor({ row, onClose }: TransmitEditorProps) {
         preserveId != null && messageNames.get(netId)?.get(preserveId) === def.message.name
           ? preserveId
           : def.message.id;
+      if (def.message.dlc > 8) {
+        setError("This CAN FD definition is available for log decoding; connected adapters currently transmit Classic CAN only.");
+        return;
+      }
       setMessageDef(def);
       setName(def.message.name);
-      setCanIdHex(id.toString(16).toUpperCase());
+      setCanIdHex((id & 0x1fffffff).toString(16).toUpperCase());
       setIsExtended(id > 0x7ff);
       setDlc(def.message.dlc);
       await decodeIntoSignals(data, def);
@@ -137,8 +141,8 @@ export function TransmitEditor({ row, onClose }: TransmitEditorProps) {
   // When editing an existing row with symbols loaded, try to resolve its message def
   useEffect(() => {
     if (row && netId) {
-      const msgName = messageNames.get(netId)?.get(row.canId);
-      if (msgName) selectMessage(msgName, row.canId);
+      const msgName = messageNames.get(netId)?.get((row.canId & 0x1fffffff) + (row.isExtended ? 0x80000000 : 0));
+      if (msgName) selectMessage(msgName, (row.canId & 0x1fffffff) + (row.isExtended ? 0x80000000 : 0));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

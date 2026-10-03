@@ -22,7 +22,9 @@ export function TraceManager() {
       const filePath = await open({
         title: "Load Trace File",
         filters: [
-          { name: "Trace Files", extensions: ["csv", "trc"] },
+          { name: "Trace Files", extensions: ["asc", "blf", "csv", "trc"] },
+          { name: "ASC", extensions: ["asc"] },
+          { name: "BLF", extensions: ["blf"] },
           { name: "CSV", extensions: ["csv"] },
           { name: "TRC", extensions: ["trc"] },
         ],
@@ -34,6 +36,7 @@ export function TraceManager() {
       }
     } catch (error) {
       console.error("Failed to load trace:", error);
+      useCanStore.setState({ traceNotice: String(error) });
     }
   };
 

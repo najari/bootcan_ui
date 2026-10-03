@@ -30,6 +30,11 @@ regex = "1"
 rayon = "1"
 crossbeam-channel = "0.5"
 mcap = { version = "0.19", features = ["zstd"] }
+canlog = { git = "https://github.com/najari/codex_test", rev = "faab3c52a2c5ff26d9ef299db7a6d2b73140d70a" }
+candb-engine = { git = "https://github.com/najari/candb-csharp-clone", rev = "c51f18848dc4e32afd96b1a6e5bc975da70c6828" }
+
+[dev-dependencies]
+tempfile = "3"
 
 # PCAN support via dlopen'd PCBUSB/PCANBasic library (Windows/macOS)
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]

@@ -261,6 +261,7 @@ pub async fn disconnect_channel(
 /// Send a CAN message
 #[tauri::command]
 pub async fn send_message(state: State<'_, AppState>, frame: FramePayload) -> Result<(), String> {
+    frame.validate_classic()?;
     log::debug!("send_message called with frame ID: 0x{:X}", frame.id);
 
     let channel = {
@@ -337,6 +338,10 @@ pub async fn start_periodic_transmit(
     frame: FramePayload,
     interval_ms: u64,
 ) -> Result<String, String> {
+    frame.validate_classic()?;
+    if interval_ms == 0 {
+        return Err("Transmit interval must be positive".into());
+    }
     let job_id = uuid::Uuid::new_v4().to_string();
 
     let channel = {
@@ -466,6 +471,7 @@ pub async fn update_periodic_transmit(
     let job = jobs
         .get(&job_id)
         .ok_or_else(|| format!("Job {} not found", job_id))?;
+    frame.validate_classic()?;
     *job.frame.write() = CanFrame::from(frame);
     Ok(())
 }
@@ -514,6 +520,7 @@ pub async fn set_advanced_filter(
     channel_id: String,
     filter: FilterSet,
 ) -> Result<(), String> {
+    let filter = filter.prepare(Default::default())?;
     let channel = {
         let manager = state.channel_manager.read();
         manager.get_channel(&channel_id)
@@ -527,6 +534,18 @@ pub async fn set_advanced_filter(
         return Err(format!("Channel {} not found", channel_id));
     }
 
+    Ok(())
+}
+
+/// One validated filter shared by live display, imported traces and filtered export.
+#[tauri::command]
+pub async fn set_display_filter(
+    state: State<'_, AppState>,
+    filter: FilterSet,
+    buses: Vec<TraceBus>,
+) -> Result<(), String> {
+    let buses = buses.into_iter().map(|b| (b.channel_id, b.bus)).collect();
+    *state.display_filter.write() = filter.prepare(buses)?;
     Ok(())
 }
 
@@ -600,7 +619,11 @@ pub async fn get_trace_window(
     limit: Option<usize>,
 ) -> Result<TraceWindow, String> {
     let limit = limit.unwrap_or(TRACE_UI_WINDOW).clamp(1, 50_000);
-    Ok(state.trace_recorder.window(limit))
+    let mut window = state.trace_recorder.window(limit);
+    window
+        .frames
+        .retain(|f| state.display_filter.read().matches(f));
+    Ok(window)
 }
 
 /// Write the retained trace (or a loaded playback file) to disk.
@@ -611,17 +634,23 @@ pub async fn export_trace(
     format: String,
     buses: Vec<TraceBus>,
     source: String,
+    filtered: Option<bool>,
 ) -> Result<u64, String> {
     let format = ExportFormat::from_str(&format)
-        .ok_or_else(|| "Invalid format. Use 'trc', 'mcap', or 'csv'".to_string())?;
+        .ok_or_else(|| "Invalid format. Use 'asc', 'blf', 'trc', 'mcap', or 'csv'".to_string())?;
 
-    let (start_epoch_ns, mut frames) = if source == "playback" {
+    let (start_epoch_ns, mut frames, metadata) = if source == "playback" {
         let player = state.trace_player.read().await;
-        trace_export::frames_from_player(&player.get_all_frames())
+        let (start, frames) = trace_export::frames_from_player(&player.get_all_frames());
+        (start, frames, player.source_metadata())
     } else {
         let (start, frames) = state.trace_recorder.snapshot();
-        (start, frames)
+        (start, frames, None)
     };
+
+    if filtered.unwrap_or(false) {
+        frames.retain(|f| state.display_filter.read().matches(&f.to_can_frame()));
+    }
 
     if frames.is_empty() {
         return Err("No trace frames to export".to_string());
@@ -630,13 +659,14 @@ pub async fn export_trace(
     let path = PathBuf::from(file_path);
     let databases = state.dbc_databases.read().clone();
     tokio::task::spawn_blocking(move || {
-        trace_export::export_trace(
+        trace_export::export_trace_with_metadata(
             &path,
             format,
             start_epoch_ns,
             &mut frames,
             &buses,
             &databases,
+            metadata.as_ref(),
         )
     })
     .await
@@ -736,7 +766,7 @@ pub async fn load_trace(
         for (bus_num_str, channel_name) in map.iter() {
             // Parse bus number from string key
             let bus_num = bus_num_str
-                .parse::<u8>()
+                .parse::<u16>()
                 .map_err(|e| format!("Invalid bus number '{}': {}", bus_num_str, e))?;
 
             // If channel names are provided, resolve them to channel IDs
@@ -782,7 +812,7 @@ pub async fn load_trace(
             // Map bus number (1-indexed) to DBC channel ID
             // Bus 1 -> first DBC channel, Bus 2 -> second DBC channel, etc.
             for (idx, channel_id) in dbc_channel_ids.iter().enumerate() {
-                mapping.insert((idx + 1) as u8, channel_id.clone());
+                mapping.insert((idx + 1) as u16, channel_id.clone());
                 log::debug!("Mapping bus {} -> channel {}", idx + 1, channel_id);
             }
         } else {
@@ -791,7 +821,7 @@ pub async fn load_trace(
             let mut channel_ids: Vec<_> = manager.get_channel_ids().iter().cloned().collect();
             channel_ids.sort(); // Sort for consistent ordering
             for (idx, channel_id) in channel_ids.iter().enumerate() {
-                mapping.insert((idx + 1) as u8, channel_id.clone());
+                mapping.insert((idx + 1) as u16, channel_id.clone());
                 log::debug!("Mapping bus {} -> channel {} (no DBC)", idx + 1, channel_id);
             }
         }
@@ -824,6 +854,9 @@ pub async fn load_trace(
             .await;
         match result {
             Ok(c) => {
+                state
+                    .playback_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 log::info!("Successfully loaded {} frames from trace file", c);
                 Ok(c)
             }
@@ -836,40 +869,38 @@ pub async fn load_trace(
 
     // Emit completion event
     let _ = app.emit("trace-load-complete", count);
+    let player = state.trace_player.read().await;
+    let _ = app.emit(
+        "trace-load-report",
+        serde_json::json!({
+            "frames": count, "issues": player.load_issues, "examples": player.load_issue_examples,
+        }),
+    );
 
     Ok(count)
 }
 
 /// Start trace playback
 #[tauri::command]
-pub async fn start_playback(state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let mut player = state.trace_player.write().await;
-        player.start()?;
-    }
-
-    // Start playback loop - frames go to the frontend only, not to hardware
-    let player_clone = state.trace_player.clone();
+pub async fn start_playback(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let mut player = state.trace_player.write().await;
+    player.start()?;
+    let ticket = state
+        .playback_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    drop(player);
+    let player = state.trace_player.clone();
     let batcher = state.frame_batcher.clone();
-
+    let generation = state.playback_generation.clone();
     tokio::spawn(async move {
-        loop {
-            let (frame, delay) = {
-                let mut player = player_clone.write().await;
-                match player.get_next_frame() {
-                    Some((f, d)) => (f, d),
-                    None => break,
-                }
-            };
-
-            // Wait for the delay
-            tokio::time::sleep(delay).await;
-
-            // The frame already has the correct channel set from bus mapping
-            batcher.push(frame);
+        if crate::core::playback::run(player, batcher, generation.clone(), ticket).await {
+            tokio::time::sleep(Duration::from_millis(33)).await;
+            if generation.load(std::sync::atomic::Ordering::Acquire) == ticket {
+                let _ = app.emit("playback-state", "stopped");
+            }
         }
     });
-
     Ok(())
 }
 
@@ -877,6 +908,9 @@ pub async fn start_playback(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn stop_playback(state: State<'_, AppState>) -> Result<(), String> {
     let mut player = state.trace_player.write().await;
+    state
+        .playback_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     player.stop();
     Ok(())
 }
@@ -920,7 +954,12 @@ pub async fn get_playback_state(state: State<'_, AppState>) -> Result<String, St
 #[tauri::command]
 pub async fn get_trace_frames(state: State<'_, AppState>) -> Result<Vec<CanFrame>, String> {
     let player = state.trace_player.read().await;
-    Ok(player.get_all_frames())
+    let filter = state.display_filter.read();
+    Ok(player
+        .get_all_frames()
+        .into_iter()
+        .filter(|f| filter.matches(f))
+        .collect())
 }
 
 /// Load a DBC or SYM file for a channel
@@ -1086,7 +1125,16 @@ pub async fn get_message_names(
         .map(|db| {
             db.messages
                 .iter()
-                .map(|(id, m)| (*id, m.name.clone()))
+                .map(|(id, m)| {
+                    (
+                        if *id > 0x7ff && *id < 0x8000_0000 {
+                            *id | 0x8000_0000
+                        } else {
+                            *id
+                        },
+                        m.name.clone(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default())
@@ -1163,7 +1211,11 @@ pub async fn get_all_signals(
             if !signals.is_empty() {
                 result.push(MessageWithSignals {
                     channel_id: channel_id.clone(),
-                    message_id: *message_id,
+                    message_id: if *message_id > 0x7ff && *message_id < 0x8000_0000 {
+                        *message_id | 0x8000_0000
+                    } else {
+                        *message_id
+                    },
                     message_name: message.name.clone(),
                     signals,
                 });
@@ -1220,6 +1272,8 @@ pub struct ProjectFile {
     pub version: String,
     pub nets: Vec<ProjectNet>,
     pub filters: Vec<ProjectFilter>,
+    #[serde(default = "default_filter_logic")]
+    pub filter_logic: String,
     pub transmit_rows: Vec<ProjectTransmitRow>,
 }
 
@@ -1254,6 +1308,10 @@ struct ProjectFileV1 {
     transmit_jobs: Vec<ProjectTransmitJobV1>,
 }
 
+fn default_filter_logic() -> String {
+    "and".into()
+}
+
 fn migrate_project_v1(v1: ProjectFileV1) -> ProjectFile {
     ProjectFile {
         version: "2.0".to_string(),
@@ -1270,6 +1328,7 @@ fn migrate_project_v1(v1: ProjectFileV1) -> ProjectFile {
             })
             .collect(),
         filters: v1.filters,
+        filter_logic: default_filter_logic(),
         transmit_rows: v1
             .transmit_jobs
             .into_iter()
@@ -1296,12 +1355,14 @@ pub async fn save_project(
     file_path: String,
     nets: Vec<ProjectNet>,
     filters: Vec<ProjectFilter>,
+    filter_logic: Option<String>,
     transmit_rows: Vec<ProjectTransmitRow>,
 ) -> Result<(), String> {
     let project = ProjectFile {
         version: "2.0".to_string(),
         nets,
         filters,
+        filter_logic: filter_logic.unwrap_or_else(default_filter_logic),
         transmit_rows,
     };
 
@@ -1354,6 +1415,7 @@ pub async fn load_project(file_path: String) -> Result<ProjectFile, String> {
         version: "2.0".to_string(),
         nets: validated_nets,
         filters: project.filters,
+        filter_logic: project.filter_logic,
         transmit_rows: project.transmit_rows,
     };
 

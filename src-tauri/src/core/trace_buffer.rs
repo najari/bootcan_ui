@@ -29,6 +29,12 @@ pub struct CapturedFrame {
     pub data: Vec<u8>,
     pub channel: String,
     pub is_tx: bool,
+    pub direction: String,
+    pub is_fd: bool,
+    pub brs: bool,
+    pub esi: bool,
+    pub raw_dlc: Option<u8>,
+    pub bus: Option<u16>,
 }
 
 impl CapturedFrame {
@@ -41,11 +47,13 @@ impl CapturedFrame {
             data: self.data.clone(),
             timestamp: self.offset_ns as f64 / 1e9,
             channel: self.channel.clone(),
-            direction: if self.is_tx {
-                "tx".to_string()
-            } else {
-                "rx".to_string()
-            },
+            direction: self.direction.clone(),
+            is_fd: self.is_fd,
+            brs: self.brs,
+            esi: self.esi,
+            raw_dlc: self.raw_dlc,
+            timestamp_ns: Some(self.offset_ns as i64),
+            bus: self.bus,
         }
     }
 }
@@ -75,6 +83,7 @@ pub struct TraceUiBatch {
     pub epoch: u64,
     pub start_index: u64,
     pub frames: Vec<CanFrame>,
+    pub visible: Vec<bool>,
 }
 
 struct Inner {
@@ -246,6 +255,12 @@ impl TraceRecorder {
             data: frame.data[..n].to_vec(),
             channel: frame.channel.clone(),
             is_tx: frame.direction.eq_ignore_ascii_case("tx"),
+            direction: frame.direction.clone(),
+            is_fd: frame.is_fd,
+            brs: frame.brs,
+            esi: frame.esi,
+            raw_dlc: frame.raw_dlc,
+            bus: frame.bus,
         });
     }
 
@@ -283,6 +298,7 @@ impl TraceRecorder {
             epoch: g.epoch,
             start_index: start as u64,
             frames,
+            visible: vec![],
         }
     }
 
@@ -345,6 +361,7 @@ mod tests {
             timestamp,
             channel: channel.to_string(),
             direction: direction.to_string(),
+            ..CanFrame::default()
         }
     }
 

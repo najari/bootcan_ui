@@ -8,6 +8,9 @@ pub struct DbcDatabase {
     pub messages: HashMap<u32, Message>,
     pub nodes: Vec<String>,
     pub value_tables: HashMap<String, ValueTable>,
+    /// Precompiled DBC codecs. SYM databases retain their existing codec.
+    #[serde(skip)]
+    pub engine: Option<std::sync::Arc<HashMap<u32, candb_engine::codec::CompiledMessage>>>,
 }
 
 /// CAN message definition from DBC
@@ -25,8 +28,8 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub name: String,
-    pub start_bit: u8,
-    pub length: u8,
+    pub start_bit: u32,
+    pub length: u32,
     pub byte_order: ByteOrder,
     pub value_type: ValueType,
     pub factor: f64,
@@ -75,7 +78,13 @@ impl DbcDatabase {
 
     /// Get a message by ID
     pub fn get_message(&self, id: u32) -> Option<&Message> {
-        self.messages.get(&id)
+        self.messages.get(&id).or_else(|| {
+            if self.engine.is_none() {
+                self.messages.get(&(id & 0x1fff_ffff))
+            } else {
+                None
+            }
+        })
     }
 
     /// Decode a signal from raw CAN data
@@ -85,6 +94,12 @@ impl DbcDatabase {
         signal_name: &str,
         data: &[u8],
     ) -> Option<DecodedSignal> {
+        if self.engine.is_some() {
+            return self
+                .decode_message(message_id, data)
+                .into_iter()
+                .find(|s| s.name == signal_name);
+        }
         let message = self.get_message(message_id)?;
         let signal = message.signals.iter().find(|s| s.name == signal_name)?;
         self.decode_one(signal, data)
@@ -92,6 +107,45 @@ impl DbcDatabase {
 
     /// Decode all signals in a message
     pub fn decode_message(&self, message_id: u32, data: &[u8]) -> Vec<DecodedSignal> {
+        if let Some(engine) = &self.engine {
+            let Some(codec) = engine.get(&message_id) else {
+                return vec![];
+            };
+            let mut scratch = candb_engine::codec::Scratch::default();
+            return codec
+                .decode(data, &mut scratch)
+                .unwrap_or_else(|error| {
+                    log::debug!("DBC decode 0x{message_id:X}: {error}");
+                    vec![]
+                })
+                .into_iter()
+                .filter_map(|row| {
+                    let raw_text = row.get("raw")?.as_str()?.to_string();
+                    let physical_value = row.get("physical")?.as_f64()?;
+                    Some(DecodedSignal {
+                        name: row.get("name")?.as_str()?.to_string(),
+                        raw_value: raw_text.parse::<i64>().unwrap_or_default(),
+                        raw_text: Some(raw_text),
+                        physical_value,
+                        unit: row
+                            .get("unit")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .into(),
+                        value_name: row
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                    })
+                })
+                .collect();
+        }
+        let message_id = if self.engine.is_none() && !self.messages.contains_key(&message_id) {
+            message_id & 0x1fff_ffff
+        } else {
+            message_id
+        };
         let Some(message) = self.get_message(message_id) else {
             return vec![];
         };
@@ -130,6 +184,7 @@ impl DbcDatabase {
         Some(DecodedSignal {
             name: signal.name.clone(),
             raw_value,
+            raw_text: None,
             physical_value,
             unit: signal.unit.clone(),
             value_name,
@@ -146,6 +201,14 @@ impl DbcDatabase {
         values: &HashMap<String, f64>,
         base: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, String> {
+        if let Some(engine) = &self.engine {
+            let codec = engine
+                .get(&message_id)
+                .ok_or_else(|| format!("Unknown DBC id 0x{message_id:X}"))?;
+            let mut values: Vec<_> = values.iter().map(|(n, v)| (n.clone(), *v)).collect();
+            values.sort_by(|a, b| a.0.cmp(&b.0));
+            return codec.encode(&values, base.as_deref(), false);
+        }
         let message = self
             .get_message(message_id)
             .ok_or_else(|| format!("Unknown message id 0x{:X}", message_id))?;
@@ -176,20 +239,20 @@ enum SignalValue {
 /// (LSB-first within a byte), matching the DBC/SYM convention.
 ///
 /// This walk is shared by decode and encode so the two can never diverge.
-fn bit_positions_msb_first(start_bit: u8, length: u8, byte_order: ByteOrder) -> Vec<u16> {
+fn bit_positions_msb_first(start_bit: u32, length: u32, byte_order: ByteOrder) -> Vec<u32> {
     let mut positions = Vec::with_capacity(length as usize);
     match byte_order {
         ByteOrder::LittleEndian => {
             // Intel: start_bit is the LSB; MSB is start_bit + length - 1
-            let start = start_bit as u16;
-            for i in (0..length as u16).rev() {
+            let start = start_bit;
+            for i in (0..length).rev() {
                 positions.push(start + i);
             }
         }
         ByteOrder::BigEndian => {
             // Motorola: start_bit is the MSB; walk descends within a byte,
             // then jumps to the MSB-side of the next byte (the sawtooth).
-            let mut pos = start_bit as u16;
+            let mut pos = start_bit;
             for _ in 0..length {
                 positions.push(pos);
                 pos = if pos % 8 == 0 { pos + 15 } else { pos - 1 };
@@ -199,7 +262,7 @@ fn bit_positions_msb_first(start_bit: u8, length: u8, byte_order: ByteOrder) -> 
     positions
 }
 
-fn get_bit(data: &[u8], pos: u16) -> Option<u64> {
+fn get_bit(data: &[u8], pos: u32) -> Option<u64> {
     let byte = (pos / 8) as usize;
     if byte >= data.len() {
         return None;
@@ -207,7 +270,7 @@ fn get_bit(data: &[u8], pos: u16) -> Option<u64> {
     Some(((data[byte] >> (pos % 8)) & 1) as u64)
 }
 
-fn set_bit(data: &mut [u8], pos: u16, bit: u64) -> Result<(), String> {
+fn set_bit(data: &mut [u8], pos: u32, bit: u64) -> Result<(), String> {
     let byte = (pos / 8) as usize;
     if byte >= data.len() {
         return Err(format!("Signal bit {} outside message payload", pos));
@@ -334,6 +397,9 @@ impl Signal {
 pub struct DecodedSignal {
     pub name: String,
     pub raw_value: i64,
+    /// Exact decimal text, including unsigned 64-bit values beyond JS precision.
+    #[serde(default)]
+    pub raw_text: Option<String>,
     pub physical_value: f64,
     pub unit: String,
     pub value_name: Option<String>, // Enumerated value name if available
@@ -345,8 +411,8 @@ mod tests {
 
     fn signal(
         name: &str,
-        start_bit: u8,
-        length: u8,
+        start_bit: u32,
+        length: u32,
         byte_order: ByteOrder,
         value_type: ValueType,
         factor: f64,
